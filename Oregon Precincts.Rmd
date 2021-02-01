@@ -1,0 +1,418 @@
+---
+title: "Oregon Precincts and the 2020 Presidential Election"
+author: "Ian McDonald"
+date: "1/25/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This project is a relatively simple map demonstration using Oregon election precincts and results from the 2020 general election. The map uses tmap's Leaflet implementation and let's users drill into a display that shows address-level two party election result with color coding and vote detail. This example displays percentages of the two party presidential election results.
+
+The challenge is consolidating precinct data that isn't consolidated at the state level by the Oregon secretary of state office. Each county reports its own data at the precinct level, and consolidated map files are hard to find.
+
+## Libraries
+
+This list and sequence should be cleaned up. I'm using the easypackages function *libraries*.
+
+```{r Libraries, message=FALSE, include=FALSE}
+packages <- c("sf", "raster", "spData", "usmap","spDataLarge", "leaflet", "rgdal", "RColorBrewer", "tmap", "tmaptools", "tidyverse", "kableExtra")
+
+library(easypackages)
+
+libraries(packages)
+```
+
+## Addresses for input
+
+This chunk can produce an address marker using the geocode\_OSM function from tmap. An example is shown here. In the next version this will use a text input for Shiny.
+
+```{r Address for input, include=FALSE}
+address_input <- c("2083 NW Johnson St., Portland OR 97209")
+
+address_raw <- geocode_OSM(address_input)
+
+address <- tibble(
+    place=c(address_input),
+    longitude=address_raw$coords["x"],
+    latitude=address_raw$coords["y"])
+
+address_sf <- st_as_sf(address, coords = c("longitude", "latitude"), 
+                       crs = "NAD83", agr = "constant")
+
+```
+
+## Shapefiles and sf objects
+
+Easiest to find old fashioned shapefiles with all the headaches described by Lovelace. I read them as sf objects using *st\_read* function. In this case, I combine an Oregon shapefile for counties with Clark County in Washington, included because Clark County is part of the Portland Metro area.
+
+### County Shapefiles
+
+I added labels from the USMAP fips lookup. Is there a better lookup table provided by the Census bureau from tidycensus?
+
+Notice that I transform the sf objects into a coordinate reference system of NAD83, although they appear to have been read with that CRS. The bind\_rows function doesn't appear to work otherwise.
+
+I need to add a state boundary, unless Oregon decides to annex Clark County.
+
+[Need to add a section with sources for all data and shapefiles]
+
+Oregon boundaries from <https://opendata.imspdx.org/dataset/november-2018-election-oregon-results-by-precinct>
+
+```{r County shapefiles, echo=TRUE}
+oregon_counties_sf <- st_read("shapefiles/oregon_counties/counties.shp", quiet = TRUE) %>% 
+    st_transform(or_counties, crs = "NAD83") %>% 
+    select(!COUNTY)
+
+washington_state_counties_sf <-
+    st_read("shapefiles/washington_counties/WA_County_Boundaries.shp", quiet = TRUE) %>%
+    st_transform(crs = "NAD83") %>%
+    mutate(STFID = as.character(JURISDIC_5)) 
+
+washington_state <- st_union(washington_state_counties_sf)
+  
+clark_county_sf <- washington_state_counties_sf %>% 
+    filter(JURISDIC_2 == "Clark") 
+
+oregon_counties_and_clark_sf <- bind_rows(oregon_counties_sf, clark_county_sf) %>% 
+    st_transform(crs = "NAD83")
+
+oregon_fips <- fips_info(oregon_counties_and_clark_sf$STFID) %>% 
+    mutate(county = gsub(" County", "", county))
+
+oregon_counties_and_clark_sf <- left_join(oregon_counties_and_clark_sf, oregon_fips, by= c("STFID" = "fips"))
+
+oregon_state <- st_union(oregon_counties_sf)
+
+oregon_bb <- st_bbox(oregon_counties_and_clark_sf)
+
+tmap_mode("plot")
+
+tm_shape(oregon_counties_and_clark_sf, bbox = oregon_bb) + 
+    tm_text("county", size = 0.5) + 
+    tm_polygons(alpha = 0, id = "county") +
+tm_shape(oregon_state) +
+    tm_borders(col = "orange", lwd = 2.5)
+```
+
+### Precinct Shapefiles
+
+Metro Portland the rest of the state are processed separately.
+
+```{r Precinct shapefiles, echo=TRUE, message=FALSE}
+
+metro_portland_precinct_sf <-  st_read("shapefiles/metro_portland_precinct/precinct.shp", quiet = TRUE) %>% 
+    select(PRECINCTID, COUNTY, geometry) %>%
+    mutate(COUNTY = case_when(
+        COUNTY == "W" ~ "Washington",
+        COUNTY == "M" ~ "Multnomah",
+        COUNTY == "C" ~ "Clackamas",
+        TRUE ~ "Other"
+        ) 
+    ) %>% 
+    st_transform(crs = "NAD83")
+
+
+clark_wa_precincts_sf  <- st_read("shapefiles/clark_precinct_shapefiles/Precinct.shp", quiet = TRUE) %>%
+    select(PRECINCTID = PRECINCT, geometry) %>%
+    mutate(PRECINCTID = str_c("K", as.character(PRECINCTID)), COUNTY = "Clark") %>% 
+    st_transform(crs = "NAD83")
+
+metro_portland_precinct_sf <- bind_rows(metro_portland_precinct_sf,
+                                        clark_wa_precincts_sf)
+
+tm_shape(metro_portland_precinct_sf) + tm_polygons()
+
+or_precinct_sf <- st_read("shapefiles/oregon_precincts/OregonPrecinctsNov2018.shp", quiet = TRUE) %>% 
+    filter(!County %in% c("Multnomah", "Washington", "Clackamas")) %>% 
+    st_transform("NAD83")
+
+tm_shape(or_precinct_sf) + tm_polygons()
+
+```
+
+## Vote data for presidential election (two major parties only)
+
+This section processes the various files with precinct level election results.
+
+### Oregon, excluding Metro Portland
+
+```{r Most Oregon precincts, include=FALSE}
+
+pre_processed_counties <- c("Multnomah", "Washington", "Clackamas", "Polk", "Yamhill", "Marion", "Tillamook", "Lane")
+
+or_precincts_votes <- read_csv("data/votes/oregon_precincts.csv", col_types = cols(.default = "c", votes = "d")) %>%   mutate(party = case_when(
+    str_detect(candidate,"Biden") ~ "DEM",
+    str_detect(candidate,"Trump") ~ "REP",
+    TRUE ~ party
+  )
+  ) %>% 
+  filter(office == "President" & party %in% c("DEM","REP")) %>% 
+  filter(!county %in% pre_processed_counties) %>% 
+  select(county, precinct, party, votes) %>% 
+  pivot_wider(names_from = party, values_from = votes) 
+
+
+```
+
+Lane County vote totals, hand tabulated from county pdf
+
+```{r Lane County election results, echo=TRUE}
+lane_votes <- read_csv("data/votes/lane.csv", col_types = cols(.default = "d", precinct = "c")) %>% 
+  mutate(county = "Lane") %>% 
+  rename(DEM = Biden, REP = Trump)
+```
+
+Marion, Polk, and Yamhill County voter data. Note these use the OpenElections standard format. Portland Metro counties generated further down
+
+Future: use purrr::map\_dfr to produce a single data table
+
+```{r Marion Polk Yamhill election results, echo=TRUE}
+
+open_election_col_types = cols(.default = "c", votes = "d")
+
+open_election_single_county_votes <- function(csv, coltypes = open_election_col_types) {
+    
+    county_df <- read_csv(csv, col_types = coltypes) %>% 
+    filter(office == "President") %>% 
+    mutate(party = case_when (
+        str_detect(candidate,"Biden") ~ "DEM",
+        str_detect(candidate,"Trump") ~ "REP",
+        TRUE ~ party
+        )
+    ) %>% 
+    filter(party %in% c("DEM", "REP")) %>% 
+    select(!candidate) %>% 
+    pivot_wider(names_from = party, values_from = votes) %>% 
+    select(county, precinct, REP, DEM)
+    return(county_df)
+}
+marion_votes <- open_election_single_county_votes("data/votes/20201103__or__general__marion__precinct.csv")
+
+polk_votes <- open_election_single_county_votes("data/votes/20201103__or__general__polk__precinct.csv")
+
+yamhill_votes <- open_election_single_county_votes("data/votes/20201103__or__general__yamhill__precinct.csv")
+
+
+```
+
+Tillamook County, hand tabulated from the published county pdf
+
+```{r Tillamook County election results, echo=TRUE}
+
+tillamook_votes <- read_csv("data/votes/tillamook_votes.csv", col_types = cols(.default = "c", DEM = "d", REP = "d")) %>% 
+  rename(precinct = precinct_votefile) %>% 
+  select(county, precinct, DEM, REP)
+```
+
+Consolidate the five additional counties with or\_precincts\_votes
+
+```{r Consolidate vote tables, echo=TRUE}
+or_precincts_votes <- bind_rows(or_precincts_votes, 
+                                tillamook_votes, 
+                                lane_votes, 
+                                polk_votes, 
+                                marion_votes, 
+                                yamhill_votes
+                                )
+```
+
+
+
+read in a lookup table that matches vote file precinct names and shape file precinct names
+
+```{r Add lookup data, echo=TRUE}
+
+lookup <- read_csv("data/votes_shapefile_lookup.csv", 
+                   col_types = cols(.default = "c")) %>% 
+    mutate(county = str_to_title(tolower(county))) 
+
+```
+
+combine lookup table and shapefile
+
+```{r Combine lookup table and shapefiles, include=FALSE}
+
+or_precinct_sf <- left_join(or_precinct_sf, lookup) %>% 
+    select(!county) 
+```
+
+Two columns have white space in the text and needs to be trimmed. Could replace regular expressions with simpler tidy version.
+
+```{r Trim whitespace}
+or_precinct_sf$precinct_votefile <- gsub('\\s+', '', or_precinct_sf$precinct_votefile)
+or_precincts_votes$precinct <- gsub('\\s+', '', or_precincts_votes$precinct)
+```
+
+```{r Join sf objects and vote tables, echo=TRUE}
+
+or_precinct_sf <- left_join(or_precinct_sf, or_precincts_votes, 
+                            by = c("County" = "county",
+                                   "precinct_votefile" = "precinct")) %>%
+    select(county = County, precinct = precinct_votefile, REP, DEM, geometry) %>%
+    st_transform(crs = "NAD83")
+
+```
+
+### Metro Portland 
+
+Multnomah, Clackamas, and Washington, plus Clark County WA
+
+Complicated because the Clackamas County reports combine several precincts. This chunk consolidates the affected precincts
+
+```{r Fix Clackamas County data, include=FALSE}
+
+clackamas_precincts_combined <- tribble(
+    ~p1, ~p2,
+    "007", "010",
+    "070", "071",
+    "099", "100",
+    "103", "104",
+    "251", "252",
+    "361", "362",
+    "417", "418"
+    ) %>% 
+    mutate(PRECINCTID = str_c("C",p1,"_",p2))
+
+combine_clackamas_precincts <- function (df, insert_df) {
+  
+    insert_df <- insert_df %>% 
+    mutate(p1 = str_c("C", p1),
+           p2 = str_c("C", p2))
+
+    extract <- df %>% filter(PRECINCTID %in% insert_df$p1 | 
+                                   PRECINCTID %in% insert_df$p2 )
+  
+    remaining <- df %>% rows_delete(extract, by = "PRECINCTID")
+  
+    insert_df <- insert_df %>% 
+        pivot_longer( 
+            cols = c(p1,p2), 
+            names_to = "p", 
+            values_to = "OLD_PRECINCTID") %>% 
+        rename(NEWPRECINCTID = PRECINCTID, PRECINCTID = OLD_PRECINCTID) %>% 
+        select(NEWPRECINCTID, PRECINCTID)
+  
+    extract <- inner_join(extract, insert_df, by = "PRECINCTID")
+    extract <- extract %>% 
+        select(-PRECINCTID) %>% 
+        rename(PRECINCTID = NEWPRECINCTID)
+  
+    df <- remaining %>% rows_insert(extract, by = "PRECINCTID")
+    return(df)
+}
+
+metro_portland_precinct_sf <- combine_clackamas_precincts(
+    metro_portland_precinct_sf,
+    clackamas_precincts_combined
+    )
+```
+
+The vote data was generated by hand before it became available in the Open Elections extract.  
+
+```{r Multnomah Clackamas Washington and Clark tables, include=FALSE}
+multnomah_votes <- read_csv("data/votes/multnomah_votes.csv", 
+                            col_types = cols(.default = "d", precinct = "c")) %>% 
+    rename(Biden = biden, Trump = trump) %>% 
+    relocate(precinct, Biden, Trump) %>% 
+    mutate(county = "Multnomah", PRECINCTID = str_c("M", precinct))
+
+clackamas_votes <- read_csv("data/votes/clackamas_votes.csv",
+                            col_types = cols(.default = "d", precinct = "c")) %>%
+    mutate(county = "Clackamas",
+           PRECINCTID = str_c("C", precinct)
+           )
+
+washington_votes <- read_csv("data/votes/washington_county_votes.csv", 
+                            col_types = cols(.default = "d", precinct = "c")) %>% 
+    mutate(county = "Washington", 
+           PRECINCTID = str_c("W", precinct)
+           )
+
+clark_votes <- read_csv("data/votes/clark_votes.csv",
+                        col_types = cols(.default = "d", precinct = "c")) %>% 
+    mutate(county = "Clark", 
+           PRECINCTID = str_c("K", precinct))
+
+metro_portland_votes <- bind_rows(multnomah_votes, 
+                                  clark_votes, 
+                                  washington_votes, 
+                                  clackamas_votes) %>%
+    select(-other)
+```
+
+Voting tables and sf objects joined here
+
+```{r}
+
+metro_portland_precinct_sf <- inner_join(metro_portland_precinct_sf, 
+                                         metro_portland_votes, 
+                                         by=("PRECINCTID")) %>% 
+    select(county = COUNTY, precinct, DEM = Biden, REP = Trump)
+
+or_precinct_sf <- bind_rows(or_precinct_sf, 
+                            metro_portland_precinct_sf
+                            )
+
+```
+
+
+
+##The Leaflet Map
+
+Some additional formatting variables added here.
+```{r Add formatting}
+or_precinct_sf <- or_precinct_sf %>% 
+    mutate(vpct = DEM/(DEM + REP)) %>%
+    mutate(pwinner = ifelse(vpct >=.5, 
+                            "DEM", 
+                            "REP"), 
+           DPR = DEM + REP) %>% 
+    mutate(pct_lbl = ifelse(pwinner == "DEM", 
+                            str_c(pwinner, " ", format(vpct*100, digits = 3)), 
+                            str_c(pwinner, " ", format(100 - vpct*100, digits = 2)))) %>%
+    mutate(hover = str_c(county," ",precinct, ": ", pct_lbl," ",DPR)) %>%
+    dplyr::select(county, precinct, vpct, DEM, REP, hover)
+
+```
+The final or_precinct_votes table has this structure:
+
+```{r}
+or_precinct_df <- st_drop_geometry(or_precinct_sf)
+or_precinct_df %>%
+  filter(county=="Multnomah" & precinct == "3605") %>%
+  kbl() %>%
+  kable_styling()
+```
+
+Draw the map
+```{r Draw the Map}
+
+tmap_mode("view")
+
+rwb <- colorRampPalette(c("red", "white", "blue"))(256)
+pctiles <- c(0,.1,.3,.45,.5,.55,.7,.9,1)
+bb_or <- bb(or_precinct_sf)
+
+tmap_options(basemaps = c(Canvas = "OpenStreetMap"))
+
+or_precincts_tmap <-
+    tm_shape(or_precinct_sf, bbox = bb_or) +
+        tm_polygons(col = "vpct", 
+                    n=length(5), 
+                    id = "hover", 
+                    style = "fixed", 
+                    breaks = pctiles, 
+                    alpha = 0.7, 
+                    palette = rwb) +
+        tm_shape(oregon_counties_and_clark_sf) + 
+            tm_borders(lwd = 1, col = "green") +
+        tm_shape(address_sf) + 
+            tm_dots()
+
+or_precincts_tmap
+
+```
